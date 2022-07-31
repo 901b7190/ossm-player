@@ -1,0 +1,5 @@
+click
+python-mpv
+scipy
+typing_extensions
+websockets
