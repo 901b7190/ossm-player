@@ -5,6 +5,7 @@ import dataclasses
 import itertools
 import json
 import logging
+import math
 import signal
 import socket
 import time
@@ -21,6 +22,9 @@ import websockets.client
 logger = logging.getLogger("ossm-player")
 
 
+InterpolatorLiteral = typing.Literal["linear", "hermite"]
+
+
 @dataclasses.dataclass
 class Config:
     host: str
@@ -31,6 +35,7 @@ class Config:
     delay: int
     buffer_size: int
     preload_ms: int
+    interpolator: InterpolatorLiteral
 
 
 class FunscriptAction(typing.TypedDict):
@@ -58,25 +63,141 @@ def scale(value: T, min_in: T, max_in: T, min_out: T, max_out: T) -> float:
     return ((max_out - min_out) * (value - min_in) / (max_in - min_in)) + min_out
 
 
+@dataclasses.dataclass
+class Frame:
+    depth: float
+    speed: float
+    time: int
+
+
 class Interpolator:
+    def __init__(self, *, funscript: Funscript, config: Config):
+        actions = funscript["actions"]
+        self._config = config
+        self._timecodes = [action["at"] for action in actions]
+        self._positions = [
+            scale(action["pos"], 0, 100, config.min_depth, config.max_depth)
+            for action in actions
+        ]
+
+    def keyframes(self) -> typing.Generator[typing.Tuple[int, float], None, None]:
+        for i, timecode_ms in enumerate(self._timecodes):
+            yield timecode_ms, self._positions[i]
+
+    def get_frames_at_timecode(self, timecode_ms: int) -> typing.List[Frame]:
+        raise NotImplementedError()
+
+    def reset(self) -> None:
+        pass
+
+
+class LinearInterpolator(Interpolator):
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self._last_frame_idx_sent = -1
+
+        self._speeds: typing.List[float] = []
+        for i, current_at in enumerate(self._timecodes[:-1]):
+            next_at = self._timecodes[i + 1]
+
+            current_depth = self._positions[i]
+            next_depth = self._positions[i + 1]
+
+            speed = 0
+            if next_at != current_at:
+                speed = abs(
+                    (next_depth - current_depth) / ((next_at - current_at) / 1000.0)
+                )
+            self._speeds.append(speed)
+        self._speeds.append(0)
+
+    def _idx_by_timecode(self, timecode_ms: int) -> int:
+        return bisect.bisect(self._timecodes, timecode_ms)
+
+    def get_frames_at_timecode(self, timecode_ms: int) -> typing.List[Frame]:
+        result: typing.List[Frame] = []
+
+        current_frame_idx = self._idx_by_timecode(timecode_ms)
+
+        first_frame_to_send = max(current_frame_idx, self._last_frame_idx_sent + 1)
+        last_frame_to_send = min(
+            current_frame_idx + self._config.buffer_size, len(self._timecodes) - 1
+        )
+        for frame_idx in range(first_frame_to_send, last_frame_to_send):
+            if self._config.preload_ms <= self._timecodes[frame_idx] - timecode_ms:
+                break
+
+            result.append(
+                Frame(
+                    depth=self._positions[frame_idx],
+                    speed=self._speeds[frame_idx],
+                    time=self._timecodes[frame_idx],
+                )
+            )
+            self._last_frame_idx_sent = frame_idx
+
+        return result
+
+    def reset(self) -> None:
+        super().reset()
+        self._last_frame_idx_sent = 0
+
+
+class CFRInterpolator(Interpolator):
+    """Constant Frame Rate"""
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self._last_frame_timecode_ms = 0
+
+    def get_frames_at_timecode(self, timecode_ms: int) -> typing.List[Frame]:
+        result: typing.List[Frame] = []
+
+        pitch = int(self._config.preload_ms / self._config.buffer_size)
+        for frame_timecode_ms in range(
+            max(timecode_ms, self._last_frame_timecode_ms),
+            timecode_ms + self._config.preload_ms,
+            pitch,
+        ):
+            result.append(
+                Frame(
+                    depth=self.depth_at(frame_timecode_ms),
+                    speed=self.speed_at(frame_timecode_ms),
+                    time=frame_timecode_ms,
+                )
+            )
+            self._last_frame_timecode_ms = frame_timecode_ms
+
+        return result
+
+    def reset(self) -> None:
+        super().reset()
+        self._last_frame_timecode_ms = 0
+
+    def depth_at(self, timecode_ms: int) -> float:
+        raise NotImplementedError()
+
+    def speed_at(self, timecode_ms: int) -> float:
+        raise NotImplementedError()
+
+
+class HermiteInterpolator(CFRInterpolator):
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self._depth = scipy.interpolate.pchip(
+            self._timecodes,
+            self._positions,
+            extrapolate=False,
+        )
+        self._speed = self._depth.derivative()
+
     class _Floatable(typing.Protocol):
         def __float__(self) -> float:
             ...
 
-    def __init__(self, funscript: Funscript, config: Config):
-        actions = funscript["actions"]
-        timecodes = [action["at"] for action in actions]
-        positions = [
-            scale(action["pos"], 0, 100, config.min_depth, config.max_depth)
-            for action in actions
-        ]
-        self._depth = scipy.interpolate.pchip(timecodes, positions, extrapolate=False)
-        self._speed = self._depth.derivative()
-
     def _cast_float(self, val: _Floatable) -> float:
-        import math
         if math.isnan(val):
-            return 0.
+            return 0.0
         return float(val)
 
     def depth_at(self, timecode_ms: int) -> float:
@@ -94,12 +215,14 @@ class OSSMController:
         self._frames_producer: typing.Optional[asyncio.Task[None]] = None
 
         funscript: Funscript = load_funscript(config.script_path)
-        self._interpolator = Interpolator(funscript, config)
+        self._interpolator = {
+            "linear": LinearInterpolator,
+            "hermite": HermiteInterpolator,
+        }[config.interpolator](funscript=funscript, config=config)
 
         self._conn: websockets.client.connect
         self._client: websockets.client.WebSocketClientProtocol
         self._beginning_of_time: float
-        self._last_frame_timecode_ms: int = 0
 
     async def __aenter__(self):
         self._conn = websockets.client.connect(
@@ -113,7 +236,13 @@ class OSSMController:
         await self._clear_frames()
 
         self._beginning_of_time = time.time() * 1000
-        await self._send_frame(self._interpolator.depth_at(0), 100, 0)
+        await self._send_frame(
+            Frame(
+                depth=next(self._interpolator.keyframes())[1],
+                speed=100,
+                time=0,
+            )
+        )
 
         return self
 
@@ -132,7 +261,7 @@ class OSSMController:
             except asyncio.CancelledError:
                 pass
 
-        self._last_frame_timecode_ms = 0
+        self._interpolator.reset()
         await self._clear_frames()
 
     async def send_frames_at(self, timecode_ms: int):
@@ -145,17 +274,11 @@ class OSSMController:
     async def _send_frames_at(self, timecode_ms: int, now: float):
         timecode_ms += self.config.delay
 
-        pitch = int(self.config.preload_ms / self.config.buffer_size)
-        for frame_timecode_ms in range(
-            max(timecode_ms, self._last_frame_timecode_ms),
-            timecode_ms + self.config.preload_ms,
-            pitch,
-        ):
-            depth = self._interpolator.depth_at(frame_timecode_ms)
-            speed = self._interpolator.speed_at(frame_timecode_ms)
-            command_time = int(now * 1000 - self._beginning_of_time + frame_timecode_ms - timecode_ms)
-            await self._send_frame(depth, speed, command_time)
-            self._last_frame_timecode_ms = frame_timecode_ms
+        for frame in self._interpolator.get_frames_at_timecode(timecode_ms):
+            frame.time = int(
+                now * 1000 - self._beginning_of_time + frame.time - timecode_ms
+            )
+            await self._send_frame(frame)
 
         self._frames_producer = None
 
@@ -172,7 +295,7 @@ class OSSMController:
             async with self._mut:
                 await self._client.send(json.dumps(data))
                 try:
-                    await asyncio.wait_for(self._wait_for_ack(), timeout=1.0)
+                    await asyncio.wait_for(self._wait_for_ack(), timeout=0.5)
                 except asyncio.TimeoutError as exc:
                     if max_retries <= n_retry:
                         raise exc
@@ -180,10 +303,15 @@ class OSSMController:
                 else:
                     break
 
-    async def _send_frame(self, depth: float, speed: float, time: int):
-        logger.info(f"sending frame {depth=} {speed=} {time=}")
+    async def _send_frame(self, frame: Frame):
+        logger.info(f"sending frame {frame.depth=} {frame.speed=} {frame.time=}")
         await self._send_and_wait_for_ack(
-            {"type": "send_frame", "depth": depth, "speed": speed, "time": time},
+            {
+                "type": "send_frame",
+                "depth": frame.depth,
+                "speed": frame.speed,
+                "time": frame.time,
+            },
         )
 
     async def _clear_frames(self):
@@ -195,7 +323,7 @@ class OSSMController:
 def load_funscript(path: str) -> Funscript:
     funscript: Funscript = json.loads(open(path).read())
     funscript["actions"] = sorted(funscript["actions"], key=lambda action: action["at"])
-    if funscript["inverted"]:
+    if funscript.get("inverted"):
         funscript["inverted"] = False
         funscript["actions"] = [
             FunscriptAction(at=action["at"], pos=100 - action["pos"])
@@ -296,7 +424,7 @@ async def play(config: Config):
                 _last_origin = time.time() - value
 
             asyncio.run_coroutine_threadsafe(
-                ossm_controller.send_frames_at(int(player.time_pos * 1000)),
+                ossm_controller.send_frames_at(int((player.time_pos or value) * 1000)),
                 loop,
             ).result()
 
@@ -314,7 +442,7 @@ async def play(config: Config):
         loop.add_signal_handler(signal.SIGTERM, _stop)
 
         with concurrent.futures.ThreadPoolExecutor() as executor:
-            finished_task, pending_tasks = await asyncio.wait(
+            finished_tasks, pending_tasks = await asyncio.wait(
                 [
                     loop.run_in_executor(executor, _play),
                     loop.run_in_executor(executor, ossm_gui.run),
@@ -322,7 +450,7 @@ async def play(config: Config):
                 return_when=asyncio.FIRST_COMPLETED,
             )
             _stop()
-            for task in itertools.chain(finished_task, pending_tasks):
+            for task in itertools.chain(finished_tasks, pending_tasks):
                 task.cancel()
                 try:
                     await task
@@ -349,16 +477,23 @@ async def play(config: Config):
 @click.option("-M", "--max-depth", help="Maximum depth in mm.", default=100)
 @click.option("-d", "--delay-ms", help="Script delay in ms.", default=100)
 @click.option(
-    "-b", "--buffer-size", help="Maximum number of frames to preload.", default=950
+    "-b", "--buffer-size", help="Maximum number of frames to preload.", default=1000
 )
 @click.option(
     "-p",
     "--preload-ms",
     help="Maximum number of milliseconds to preload.",
-    default=16000,
+    default=30000,
 )
 @click.option(
-    "-d",
+    "-i",
+    "--interpolator",
+    help="Type of interpolation.",
+    type=click.Choice(["linear", "hermite"]),
+    default="linear",
+)
+@click.option(
+    "-mh",
     "--mdns-hostname",
     help="MDSN hostname of the OSSM device.",
     default="ossm-stroke.local",
@@ -373,6 +508,7 @@ def main(
     buffer_size: int,
     preload_ms: int,
     host: typing.Optional[str],
+    interpolator: InterpolatorLiteral,
     mdns_hostname: str,
     verbose: int,
     video: str,
@@ -416,6 +552,7 @@ def main(
                 delay=delay_ms,
                 buffer_size=buffer_size,
                 preload_ms=preload_ms,
+                interpolator=interpolator,
             )
         )
     )
